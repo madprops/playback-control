@@ -10,9 +10,11 @@ To compile, go to audacious-plugins and run this:
 
 `rm -rf build && meson setup build --prefix=/usr && cd build && ninja && sudo ninja install && cd ..`
 
-Then run the compiled audacious.
-
 You might need to run this first: `pkg-config --variable=plugin_dir audacious`
+
+---
+
+This is meant to be used with a costumized `audacious`, you might need to recompile it.
 
 ---
 
