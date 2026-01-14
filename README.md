@@ -10,11 +10,13 @@ To compile, go to audacious-plugins and run this:
 
 `rm -rf build && meson setup build --prefix=/usr && cd build && ninja && sudo ninja install && cd ..`
 
-You might need to run this first: `pkg-config --variable=plugin_dir audacious`
-
 ---
 
 This is meant to be used with a costumized `audacious`, you might need to recompile it.
+
+If you're using `fish` run this to make sure `audacious` runs:
+
+`set -Ux LD_LIBRARY_PATH /usr/local/lib $LD_LIBRARY_PATH`
 
 ---
 
