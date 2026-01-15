@@ -1,4 +1,9 @@
 #include "playback-control.h"
+
+#include <vector>
+#include <list>
+#include <map>
+
 #include <libaudcore/i18n.h>
 #include <libaudcore/runtime.h>
 #include <libaudcore/drct.h>
@@ -11,105 +16,252 @@
 
 EXPORT PlaybackControl aud_plugin_instance;
 
-static bool is_active = false;
+// --- Data Structures ---
 
-// Forward Declarations
-static void update_stop_rule(void * = nullptr, void * = nullptr);
-static void update_menu_items();
+struct QueueEntry {
+    int playlist_id;
+    int entry_idx;
+
+    bool operator==(const QueueEntry &other) const {
+        return (playlist_id == other.playlist_id && entry_idx == other.entry_idx);
+    }
+};
+
+// --- Global State ---
+
+static bool stop_after_queue_active = true; // Enabled by default
+static std::list<QueueEntry> global_queue;
+static std::map<int, std::vector<int>> local_snapshots;
+
+// We use these to track "Where did we just come from?"
+static int last_playing_playlist = -1;
+static int last_playing_index = -1;
+
+// --- Forward Declarations ---
+
+static void update_stop_rule();
+static void sync_global_queue();
+static void perform_jump();
+static void jump_timer_cb(void * data);
 static void toggle_stop_after_queue();
+static void update_menu_text();
 
 // --- Logic ---
 
-static void update_stop_rule(void * /* data */, void * /* user */)
-{
-    if (!is_active) return;
+static void sync_global_queue() {
+    int n_playlists = Playlist::n_playlists();
 
-    Playlist playlist = Playlist::active_playlist();
+    for (int i = 0; i < n_playlists; i++) {
+        Playlist p = Playlist::by_index(i);
+        int n_queued = p.n_queued();
+        std::vector<int> current_local;
 
-    // If Queue is empty (0), we set "stop_after_current_song" to TRUE.
-    // This causes the Stop button in the UI to light up/highlight.
-    bool should_stop = (playlist.n_queued() == 0);
+        for (int q = 0; q < n_queued; q++) {
+            current_local.push_back(p.queue_get_entry(q));
+        }
 
+        std::vector<int> &last_local = local_snapshots[i];
+
+        // 1. Detect Additions
+        for (int song_idx : current_local) {
+            bool found = false;
+            for (int old_idx : last_local) {
+                if (song_idx == old_idx) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                global_queue.push_back({i, song_idx});
+            }
+        }
+
+        // 2. Detect Removals
+        auto it = global_queue.begin();
+        while (it != global_queue.end()) {
+            if (it->playlist_id == i) {
+                bool still_exists = false;
+                for (int song_idx : current_local) {
+                    if (song_idx == it->entry_idx) {
+                        still_exists = true;
+                        break;
+                    }
+                }
+                if (!still_exists) {
+                    it = global_queue.erase(it);
+                } else {
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+
+        last_local = current_local;
+    }
+}
+
+static void update_stop_rule() {
+    if (!stop_after_queue_active) {
+        aud_set_bool(nullptr, "stop_after_current_song", false);
+        return;
+    }
+    // Only stop if the GLOBAL queue is empty
+    bool should_stop = global_queue.empty();
     aud_set_bool(nullptr, "stop_after_current_song", should_stop);
+}
+
+static void perform_jump() {
+    if (global_queue.empty()) return;
+
+    QueueEntry next = global_queue.front();
+
+    Playlist p = Playlist::by_index(next.playlist_id);
+    if (next.playlist_id >= Playlist::n_playlists()) return;
+
+    p.activate();
+    p.set_position(next.entry_idx);
+
+    // Remove from native queue to avoid duplicates
+    int n_queued = p.n_queued();
+    for (int i = 0; i < n_queued; i++) {
+        if (p.queue_get_entry(i) == next.entry_idx) {
+            p.queue_remove(i);
+            break;
+        }
+    }
+
+    p.start_playback();
+
+    // Reset the stop rule to ensure we don't stop immediately
+    if (stop_after_queue_active) {
+         aud_set_bool(nullptr, "stop_after_current_song", false);
+    }
+}
+
+static void jump_timer_cb(void * data) {
+    timer_remove(TimerRate::Hz30, jump_timer_cb, data);
+    perform_jump();
+}
+
+// --- Hooks ---
+
+static void on_playlist_update(void * = nullptr, void * = nullptr) {
+    sync_global_queue();
+    update_stop_rule();
+}
+
+static void on_playback_end(void * = nullptr, void * = nullptr) {
+    // Song ended naturally. If we have a queue, jump to it.
+    if (!global_queue.empty()) {
+        timer_add(TimerRate::Hz30, jump_timer_cb, nullptr);
+    }
+}
+
+// Intercept the "Next" button here
+static void on_playback_ready(void * = nullptr, void * = nullptr) {
+    int current_pl = Playlist::playing_playlist().index();
+    int candidate_pos = Playlist::playing_playlist().get_position();
+
+    if (global_queue.empty()) {
+        last_playing_playlist = current_pl;
+        last_playing_index = candidate_pos;
+        return;
+    }
+
+    QueueEntry next_q = global_queue.front();
+
+    // 1. Is the song about to play THE queued song? (We made it!)
+    if (current_pl == next_q.playlist_id && candidate_pos == next_q.entry_idx) {
+        global_queue.pop_front();
+
+        // Clean native queue
+        Playlist p = Playlist::by_index(current_pl);
+        int n_queued = p.n_queued();
+        for (int i=0; i<n_queued; i++) {
+             if (p.queue_get_entry(i) == candidate_pos) { p.queue_remove(i); break; }
+        }
+
+        last_playing_playlist = current_pl;
+        last_playing_index = candidate_pos;
+        return;
+    }
+
+    // 2. Is this a "Linear Advance" (Next Button pressed)?
+    bool is_linear_advance = false;
+
+    if (current_pl == last_playing_playlist) {
+        // Standard Next: Last + 1
+        if (candidate_pos == last_playing_index + 1) is_linear_advance = true;
+
+        // Wrap Around Next: Last was end, now 0
+        Playlist p = Playlist::by_index(current_pl);
+        if (last_playing_index == p.n_entries() - 1 && candidate_pos == 0) is_linear_advance = true;
+    }
+
+    // HIJACK LOGIC
+    if (is_linear_advance) {
+        // CRITICAL FIX: Stop the current "wrong" song immediately.
+        // If we don't stop it, the engine locks in the stream and our timer fires too late.
+        aud_drct_stop();
+
+        // Schedule the jump to happen in the next tick
+        timer_add(TimerRate::Hz30, jump_timer_cb, nullptr);
+        return;
+    }
+
+    // 3. If it's a manual Double-Click (not linear), we do nothing and let it play.
+    last_playing_playlist = current_pl;
+    last_playing_index = candidate_pos;
 }
 
 // --- Menu Management ---
 
-static constexpr AudMenuID menus[] = {
-    AudMenuID::Main,
-    AudMenuID::Playlist
-};
-
-// We use this to refresh the menu text
-static void update_menu_items()
-{
-    // 1. Remove the existing items (using the function pointer to identify them)
-    for (AudMenuID menu : menus)
-    {
-        aud_plugin_menu_remove(menu, toggle_stop_after_queue);
-    }
-
-    // 2. Define the new name based on state
-    const char * name = is_active ? _("Stop After Queue (ON)") : _("Stop After Queue (OFF)");
-    const char * icon = is_active ? "process-stop" : "media-playback-start";
-
-    // 3. Re-add the items
-    for (AudMenuID menu : menus)
-    {
-        aud_plugin_menu_add(menu, toggle_stop_after_queue, name, icon);
-    }
+static void toggle_stop_after_queue() {
+    stop_after_queue_active = !stop_after_queue_active;
+    update_stop_rule();
+    update_menu_text();
 }
 
-static void toggle_stop_after_queue()
-{
-    is_active = !is_active;
+static void update_menu_text() {
+    aud_plugin_menu_remove(AudMenuID::Main, toggle_stop_after_queue);
 
-    if (is_active)
-    {
-        // Enabled
-        update_stop_rule(); // Check immediately
-        hook_associate("playback ready", update_stop_rule, nullptr);
-        hook_associate("playlist update", update_stop_rule, nullptr);
-        AUDINFO("Stop After Queue: ENABLED\n");
-    }
-    else
-    {
-        // Disabled
-        hook_dissociate("playback ready", update_stop_rule);
-        hook_dissociate("playlist update", update_stop_rule);
+    const char * name = stop_after_queue_active ? _("Stop After Queue (ON)") : _("Stop After Queue (OFF)");
+    const char * icon = stop_after_queue_active ? "process-stop" : "media-playback-start";
 
-        // Reset the native stop button
-        aud_set_bool(nullptr, "stop_after_current_song", false);
-        AUDINFO("Stop After Queue: DISABLED\n");
-    }
-
-    // Update the visual menu text
-    update_menu_items();
+    aud_plugin_menu_add(AudMenuID::Main, toggle_stop_after_queue, name, icon);
 }
 
 // --- Plugin Entry Points ---
 
-bool PlaybackControl::init()
-{
-    // Add the initial menu items (defaults to OFF)
-    update_menu_items();
+bool PlaybackControl::init() {
+    global_queue.clear();
+    local_snapshots.clear();
+    sync_global_queue();
+
+    hook_associate("playlist update", on_playlist_update, nullptr);
+    hook_associate("playback end", on_playback_end, nullptr);
+    hook_associate("playback ready", on_playback_ready, nullptr);
+
+    update_menu_text();
+    update_stop_rule();
+
     return true;
 }
 
-void PlaybackControl::cleanup()
-{
-    if (is_active)
-    {
-        hook_dissociate("playback ready", update_stop_rule);
-        hook_dissociate("playlist update", update_stop_rule);
+void PlaybackControl::cleanup() {
+    hook_dissociate("playlist update", on_playlist_update);
+    hook_dissociate("playback end", on_playback_end);
+    hook_dissociate("playback ready", on_playback_ready);
+    timer_remove(TimerRate::Hz30, jump_timer_cb, nullptr);
+
+    aud_plugin_menu_remove(AudMenuID::Main, toggle_stop_after_queue);
+
+    if (stop_after_queue_active) {
         aud_set_bool(nullptr, "stop_after_current_song", false);
     }
 
-    // Remove menus
-    for (AudMenuID menu : menus)
-    {
-        aud_plugin_menu_remove(menu, toggle_stop_after_queue);
-    }
-
-    is_active = false;
+    stop_after_queue_active = false;
+    global_queue.clear();
+    local_snapshots.clear();
 }

@@ -25,3 +25,9 @@ With stop after queued you get a workflow that allows you to only play songs you
 ---
 
 I make this plugin as an attempt to add the level of control I think is missing in music players. Stop after queue was an important piece but there might be more that will be implemented later on.
+
+---
+
+This also enables a global queue.
+
+Songs jump between playlists instead of each playlist having its own queue.
