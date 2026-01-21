@@ -3,6 +3,7 @@
 #include <vector>
 #include <list>
 #include <map>
+#include <algorithm>
 
 #include <libaudcore/i18n.h>
 #include <libaudcore/runtime.h>
@@ -51,54 +52,48 @@ static void update_menu_text();
 static void sync_global_queue() {
     int n_playlists = Playlist::n_playlists();
 
+    std::map<int, std::vector<int>> current_snapshot;
+
     for (int i = 0; i < n_playlists; i++) {
         Playlist p = Playlist::by_index(i);
         int n_queued = p.n_queued();
-        std::vector<int> current_local;
+        std::vector<int> queued;
+        queued.reserve(n_queued);
 
         for (int q = 0; q < n_queued; q++) {
-            current_local.push_back(p.queue_get_entry(q));
+            queued.push_back(p.queue_get_entry(q));
         }
 
-        std::vector<int> &last_local = local_snapshots[i];
-
-        // 1. Detect Additions
-        for (int song_idx : current_local) {
-            bool found = false;
-            for (int old_idx : last_local) {
-                if (song_idx == old_idx) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                global_queue.push_back({i, song_idx});
-            }
-        }
-
-        // 2. Detect Removals
-        auto it = global_queue.begin();
-        while (it != global_queue.end()) {
-            if (it->playlist_id == i) {
-                bool still_exists = false;
-                for (int song_idx : current_local) {
-                    if (song_idx == it->entry_idx) {
-                        still_exists = true;
-                        break;
-                    }
-                }
-                if (!still_exists) {
-                    it = global_queue.erase(it);
-                } else {
-                    ++it;
-                }
-            } else {
-                ++it;
-            }
-        }
-
-        last_local = current_local;
+        current_snapshot[i] = std::move(queued);
     }
+
+    std::list<QueueEntry> new_global;
+
+    for (const QueueEntry &qe : global_queue) {
+        auto snap_it = current_snapshot.find(qe.playlist_id);
+        if (snap_it == current_snapshot.end()) continue;
+
+        auto &entries = snap_it->second;
+        auto pos = std::find(entries.begin(), entries.end(), qe.entry_idx);
+        if (pos != entries.end()) {
+            new_global.push_back(qe);
+            entries.erase(pos);
+        }
+    }
+
+    for (int i = 0; i < n_playlists; i++) {
+        auto snap_it = current_snapshot.find(i);
+        if (snap_it == current_snapshot.end()) continue;
+
+        for (int entry : snap_it->second) {
+            new_global.push_back({i, entry});
+        }
+    }
+
+    global_queue.swap(new_global);
+    local_snapshots.swap(current_snapshot);
+
+    update_stop_rule();
 }
 
 static void update_stop_rule() {
@@ -148,7 +143,6 @@ static void jump_timer_cb(void * data) {
 
 static void on_playlist_update(void * = nullptr, void * = nullptr) {
     sync_global_queue();
-    update_stop_rule();
 }
 
 static void on_playback_end(void * = nullptr, void * = nullptr) {
@@ -184,6 +178,7 @@ static void on_playback_ready(void * = nullptr, void * = nullptr) {
 
         last_playing_playlist = current_pl;
         last_playing_index = candidate_pos;
+        update_stop_rule();
         return;
     }
 

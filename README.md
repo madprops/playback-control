@@ -8,6 +8,8 @@ This can be found in the `Services` menu.
 
 To compile, go to `audacious-plugins` and run this:
 
+`export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig`
+
 `rm -rf build && meson setup build --prefix=/usr && cd build && ninja && sudo ninja install && cd ..`
 
 ---
